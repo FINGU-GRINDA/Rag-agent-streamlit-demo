@@ -8,19 +8,19 @@ from byaldi import RAGMultiModalModel
 from openai import OpenAI
 
 # ------------------------------------------------------------------
-# 1. folders
+# Force CPU everywhere
 # ------------------------------------------------------------------
+os.environ["CUDA_VISIBLE_DEVICES"] = ""         # make CUDA invisible
+torch_dtype = "float32"                         # safe dtype for CPU
+
 UPLOAD_ROOT = "uploads"
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
-# ------------------------------------------------------------------
-# 2. Streamlit page setup
-# ------------------------------------------------------------------
 st.set_page_config(page_title="RAG Agent", layout="wide")
 st.title("🦾 RAG Agent – PDF Q&A")
 
 # ------------------------------------------------------------------
-# 3. Load ColPali **CPU-only**
+# Load ColPali once (CPU-only)
 # ------------------------------------------------------------------
 @st.cache_resource(
     show_spinner="Loading ColPali embeddings (first run may take a few minutes)…"
@@ -28,20 +28,20 @@ st.title("🦾 RAG Agent – PDF Q&A")
 def load_retriever():
     return RAGMultiModalModel.from_pretrained(
         "vidore/colpali-v1.2",
-        device_map={"": "cpu"},     # <- crucial: keep everything on CPU
-        torch_dtype="float32"       # <- safest dtype for CPU hosts
+        n_gpu=0,                  # <-- key: bypass auto cuda device-map
+        torch_dtype=torch_dtype,
     )
 
 retriever = load_retriever()
 
-# Keep thumbnails in session
+# session state for thumbnails
 if "all_images" not in st.session_state:
     st.session_state["all_images"] = {}
 if "ready" not in st.session_state:
     st.session_state["ready"] = False
 
 # ------------------------------------------------------------------
-# 4. Small helpers
+# Helpers
 # ------------------------------------------------------------------
 def pil_to_b64(img: Image.Image) -> str:
     buf = BytesIO()
@@ -49,12 +49,10 @@ def pil_to_b64(img: Image.Image) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 # ------------------------------------------------------------------
-# 5. Sidebar – upload & index
+# Sidebar – upload & index
 # ------------------------------------------------------------------
 st.sidebar.header("📄 Documents")
-files = st.sidebar.file_uploader(
-    "Upload PDF files", type="pdf", accept_multiple_files=True
-)
+files = st.sidebar.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
 
 if st.sidebar.button("Build index", disabled=not files):
     tmp_dir = os.path.join(UPLOAD_ROOT, uuid.uuid4().hex)
@@ -62,21 +60,18 @@ if st.sidebar.button("Build index", disabled=not files):
     st.session_state["all_images"].clear()
 
     with st.sidebar.status("Indexing…", expanded=True) as status:
-        # save
         for f in files:
             dest = os.path.join(tmp_dir, f.name)
             with open(dest, "wb") as out:
                 out.write(f.read())
             status.update(label=f"Saved {f.name}")
 
-        # convert pages
         for doc_id, pdf in enumerate(os.listdir(tmp_dir)):
             if pdf.lower().endswith(".pdf"):
                 status.update(label=f"Converting {pdf}")
                 pages = convert_from_path(os.path.join(tmp_dir, pdf))
                 st.session_state["all_images"][doc_id] = pages
 
-        # embed
         status.update(label="Embedding images")
         retriever.index(
             input_path=tmp_dir,
@@ -88,7 +83,7 @@ if st.sidebar.button("Build index", disabled=not files):
         status.update(state="complete", label="Index ready ✅")
 
 # ------------------------------------------------------------------
-# 6. Main area – preview & ask
+# Main – preview & ask
 # ------------------------------------------------------------------
 if st.session_state["ready"]:
     st.subheader("Preview")
@@ -124,18 +119,12 @@ if st.session_state["ready"]:
                 messages = [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a helpful assistant for professionals "
-                            "working in factories."
-                        ),
+                        "content": "You are a helpful assistant for professionals working in factories.",
                     },
                     {
                         "role": "user",
                         "content": [
-                            *[
-                                {"type": "image_url", "image_url": {"url": u}}
-                                for u in img_urls
-                            ],
+                            *[{"type": "image_url", "image_url": {"url": u}} for u in img_urls],
                             {"type": "text", "text": q},
                         ],
                     },
@@ -153,6 +142,5 @@ if st.session_state["ready"]:
                 ccols = st.columns(len(imgs))
                 for i, img in enumerate(imgs):
                     ccols[i].image(img, use_column_width=True)
-
 else:
     st.info("Upload PDFs in the sidebar and click **Build index** to begin.")
