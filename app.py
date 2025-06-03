@@ -92,16 +92,15 @@ if st.sidebar.button("Build / Load index", disabled=not files):
 
     # Embed batch if there are new PDFs
     if new_pdfs:
-        with st.sidebar.spinner("Embedding new PDFs…"):
-            # Put all new PDFs in one temp folder
-            embed_dir = new_folder  # already contains only new pdfs
-            retriever.index(
-                input_path=str(embed_dir),
-                index_name=str(GLOBAL_INDEX),
-                store_collection_with_index=True,
-                overwrite=False           # append to existing index
-            )
-            st.sidebar.success("New PDFs embedded and cached.")
+with st.spinner("Embedding new PDFs…"):           # ← use st.spinner, not st.sidebar.spinner
+    retriever.index(
+        input_path=str(embed_dir),
+        index_name=str(GLOBAL_INDEX),
+        store_collection_with_index=True,
+        overwrite=False
+    )
+    st.sidebar.success("New PDFs embedded and cached.")
+
 
     st.session_state["ready"] = True
 
