@@ -1,0 +1,7 @@
+streamlit
+pdf2image
+pillow
+byaldi
+qwen-vl-utils
+openai
+huggingface_hub[hf_transfer]
