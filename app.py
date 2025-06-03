@@ -26,11 +26,12 @@ st.title("🦾 RAG Agent – PDF Q&A")
     show_spinner="Loading ColPali embeddings (first run may take a few minutes)…"
 )
 def load_retriever():
+    # CPU-only load so Streamlit Cloud (no NVIDIA driver) doesn’t crash
     return RAGMultiModalModel.from_pretrained(
         "vidore/colpali-v1.2",
-        device="cpu",           # <- the only change
-        torch_dtype="float32"
+        device="cpu"          # keep everything on CPU
     )
+
 
 
 retriever = load_retriever()
