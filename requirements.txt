@@ -1,5 +1,6 @@
 streamlit
-pdf2image
+pdf2image>=1.17.0
+
 pillow
 byaldi
 qwen-vl-utils
