@@ -1,93 +1,128 @@
-import os, uuid, hashlib, json, base64, shutil, time
+import os, uuid, hashlib, base64, shutil
 from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
 from pdf2image import convert_from_path
-from pdf2image.exceptions import PDFInfoNotInstalledError  # ← correct place
-
+from pdf2image.exceptions import PDFInfoNotInstalledError
 from PIL import Image
 from byaldi import RAGMultiModalModel
 from openai import OpenAI
 
-# ---------------- config ----------------
-CACHE_DIR = Path("data/cache")
+# --------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------
+CACHE_DIR = Path("data/cache")           # persisted between restarts
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 UPLOAD_ROOT = Path("uploads")
 UPLOAD_ROOT.mkdir(exist_ok=True)
 
+GLOBAL_INDEX = CACHE_DIR / "image_index"   # .json + .faiss
+
+# --------------------------------------------------------------------
+# UI config
+# --------------------------------------------------------------------
 st.set_page_config(page_title="RAG Agent", layout="wide")
 st.title("🦾 RAG Agent – PDF Q&A")
 
-@st.cache_resource(show_spinner="Loading ColPali…")
+# --------------------------------------------------------------------
+# Load ColPali once (CPU-only)
+# --------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading ColPali embeddings…")
 def load_retriever():
-    return RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2", device="cpu")
+    model = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2", device="cpu")
+    # Load existing global index if present
+    if (GLOBAL_INDEX.with_suffix(".json")).exists():
+        try:
+            model.load(str(GLOBAL_INDEX))
+            st.sidebar.info("Global index loaded from cache.")
+        except Exception as e:
+            st.sidebar.warning(f"Could not load cache: {e}")
+    return model
 
 retriever = load_retriever()
 
-# -------------- helpers -----------------
-def pdf_sha(file_bytes: bytes) -> str:
-    return hashlib.sha256(file_bytes).hexdigest()[:20]
+# Keep thumbnails in session
+if "images" not in st.session_state:
+    st.session_state["images"] = {}   # sha -> list[PIL]
+if "ready" not in st.session_state:
+    st.session_state["ready"] = False
 
-def save_pdf(tmp_dir: Path, file_name: str, data: bytes) -> Path:
-    p = tmp_dir / file_name
-    with open(p, "wb") as f: f.write(data)
-    return p
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+def pdf_sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:20]
 
 def pil_to_b64(img: Image.Image) -> str:
-    buf = BytesIO(); img.save(buf, format="JPEG", quality=80)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=80)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
-# -------------- sidebar -----------------
+# --------------------------------------------------------------------
+# Sidebar – upload & index
+# --------------------------------------------------------------------
 st.sidebar.header("📄 Documents")
-files = st.sidebar.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+files = st.sidebar.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
 
 if st.sidebar.button("Build / Load index", disabled=not files):
-    tmp_dir = UPLOAD_ROOT / uuid.uuid4().hex
-    tmp_dir.mkdir()
+    new_folder = UPLOAD_ROOT / uuid.uuid4().hex
+    new_folder.mkdir()
 
-    sha_list, new_pdfs = [], []
+    new_pdfs = []          # [(sha, path)]
     for f in files:
         data = f.read()
         sha = pdf_sha(data)
-        sha_list.append(sha)
-        if not (CACHE_DIR / f"{sha}.json").exists():
-            p = save_pdf(tmp_dir, f.name, data)
-            new_pdfs.append((sha, p))
+        pdf_path = new_folder / f"{sha}.pdf"
+        pdf_path.write_bytes(data)
 
-    if not sha_list:
-        st.sidebar.warning("Nothing to index.")
-        st.stop()
+        # Convert pages for preview (always, so we have images)
+        try:
+            pages = convert_from_path(pdf_path, dpi=150)
+        except PDFInfoNotInstalledError:
+            st.error("Poppler is missing. Make sure packages.txt has `poppler-utils`.")
+            st.stop()
 
-    # --- step 1: (re)build missing PDFs ---
+        st.session_state["images"][sha] = pages
+
+        # Only embed if this PDF hasn't been cached yet
+        if not (GLOBAL_INDEX.with_suffix(".json")).exists() or sha not in retriever.model.doc_ids:
+            new_pdfs.append(pdf_path)
+
+    # Embed batch if there are new PDFs
     if new_pdfs:
-        with st.sidebar.status("Indexing new PDFs…", expanded=True) as status:
-            for sha, path in new_pdfs:
-                status.update(label=f"Converting {path.name}")
-                try:
-                    pages = convert_from_path(path, dpi=150)
-                except PDFInfoNotInstalledError:
-                    st.error("Poppler missing – ensure packages.txt has poppler-utils")
-                    st.stop()
+        with st.sidebar.spinner("Embedding new PDFs…"):
+            # Put all new PDFs in one temp folder
+            embed_dir = new_folder  # already contains only new pdfs
+            retriever.index(
+                input_path=str(embed_dir),
+                index_name=str(GLOBAL_INDEX),
+                store_collection_with_index=True,
+                overwrite=False           # append to existing index
+            )
+            st.sidebar.success("New PDFs embedded and cached.")
 
-                status.update(label=f"Embedding {path.name}")
-                retriever.add_images(pages, doc_id=sha)   # stream in
-
-                retriever.save(str(CACHE_DIR / sha))      # writes .json & .faiss
-                status.update(label=f"Cached {sha}")
-
-    # --- step 2: load all selected PDFs into current retriever ---
-    retriever.reset()
-    for sha in sha_list:
-        retriever.load(str(CACHE_DIR / sha))
-
-    st.session_state["sha_list"] = sha_list
     st.session_state["ready"] = True
-    st.sidebar.success("Index ready ✅")
 
-# -------------- main ----------------
-if st.session_state.get("ready"):
-    q = st.text_area("Ask your question")
+# --------------------------------------------------------------------
+# Main – ask questions
+# --------------------------------------------------------------------
+if st.session_state["ready"]:
+    # Preview thumbnails
+    st.subheader("Preview")
+    for sha, pages in st.session_state["images"].items():
+        with st.expander(f"Document {sha} — {len(pages)} pages"):
+            cols = st.columns(5)
+            for i, img in enumerate(pages[:20]):
+                thumb = img.copy()
+                thumb.thumbnail((300, 300))
+                cols[i % 5].image(thumb, caption=f"Page {i + 1}", use_column_width=True)
+
+    st.divider()
+    st.subheader("Ask a question")
+
+    q = st.text_area("Question", height=100)
     if st.button("Get answer", disabled=not q.strip()):
         with st.spinner("Searching & querying Qwen…"):
             hits = retriever.search(q, k=3)
@@ -95,23 +130,32 @@ if st.session_state.get("ready"):
                 st.error("No relevant information found.")
                 st.stop()
 
-            # gather context images
-            ctx_imgs = [hit["image"] for hit in hits]     # byaldi returns PILs
-            urls = [pil_to_b64(img) for img in ctx_imgs]
+            ctx_imgs = [st.session_state["images"][h['doc_id']][h['page_num'] - 1]
+                        for h in hits]
+            urls = [pil_to_b64(i) for i in ctx_imgs]
 
-            client = OpenAI(base_url="https://openrouter.ai/api/v1",
-                            api_key=os.getenv("OPENROUTER_API_KEY"))
+            client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=os.getenv("OPENROUTER_API_KEY"),
+            )
             msg = [
-                {"role": "system", "content": "You are a helpful factory assistant."},
+                {"role": "system", "content": "You are a helpful assistant for factory professionals."},
                 {"role": "user", "content": [*[
-                    {"type":"image_url","image_url":{"url":u}} for u in urls
-                ], {"type":"text","text": q}]}
+                    {"type": "image_url", "image_url": {"url": u}} for u in urls
+                ], {"type": "text", "text": q}]}
             ]
             resp = client.chat.completions.create(
                 model="qwen/qwen-2.5-vl-7b-instruct:free",
-                messages=msg, temperature=0
+                messages=msg,
+                temperature=0
             )
+
         st.success("Answer")
         st.write(resp.choices[0].message.content)
+
+        st.subheader("Context pages")
+        ccols = st.columns(len(ctx_imgs))
+        for i, img in enumerate(ctx_imgs):
+            ccols[i].image(img, use_column_width=True)
 else:
-    st.info("Upload PDFs and click **Build / Load index**.")
+    st.info("Upload PDFs and click **Build / Load index** to begin.")
