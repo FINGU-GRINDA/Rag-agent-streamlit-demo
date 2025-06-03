@@ -28,9 +28,10 @@ st.title("🦾 RAG Agent – PDF Q&A")
 def load_retriever():
     return RAGMultiModalModel.from_pretrained(
         "vidore/colpali-v1.2",
-        n_gpu=0,                  # <-- key: bypass auto cuda device-map
-        torch_dtype=torch_dtype,
+        device="cpu",           # <- the only change
+        torch_dtype="float32"
     )
+
 
 retriever = load_retriever()
 
