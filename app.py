@@ -3,7 +3,9 @@ from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
-from pdf2image import convert_from_path, PDFInfoNotInstalledError
+from pdf2image import convert_from_path
+from pdf2image.exceptions import PDFInfoNotInstalledError  # ← correct place
+
 from PIL import Image
 from byaldi import RAGMultiModalModel
 from openai import OpenAI
