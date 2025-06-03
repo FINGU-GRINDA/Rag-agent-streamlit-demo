@@ -92,8 +92,8 @@ if st.sidebar.button("Build / Load index", disabled=not files):
 
     # Embed batch if there are new PDFs
     if new_pdfs:
-        with st.spinner("Embedding new PDFs…"):           # ← use st.spinner, not st.sidebar.spinner
-    retriever.index(
+        with st.spinner("Embedding new PDFs…"):
+            retriever.index(
         input_path=str(embed_dir),
         index_name=str(GLOBAL_INDEX),
         store_collection_with_index=True,
