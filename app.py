@@ -1,86 +1,102 @@
-# Streamlit Excel-to-Chat Demo
+# app.py – Streamlit demo: chat with any Excel workbook
 import os
 import re
-import sqlite3
+import io
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
 from langchain_community.llms import OpenAI
 from langchain_community.utilities import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
-from sqlalchemy import create_engine
 
-# ---------- Setup ----------
+# ---------- Streamlit setup ----------
 st.set_page_config(page_title="Excel Q&A", layout="wide")
 st.title("📊 Chat with your Excel Data")
 
-# Load environment variables
+# ---------- ENV / Keys ----------
 load_dotenv()
-openai_key = os.getenv("OPENAI_API_KEY")
-
-if not openai_key:
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
     st.error(
-        "Add your OpenAI key to a .env file as `OPENAI_API_KEY=sk-...` "
-        "and restart the app."
+        "Add your OpenAI API key to a .env file as\n\n"
+        "OPENAI_API_KEY=sk-...\n\nand restart the app."
     )
     st.stop()
 
 # ---------- Helpers ----------
 def sanitize(name: str) -> str:
-    """SQLite-safe table name."""
-    return re.sub(r"\W+", "_", name)
+    """Return a SQLite-safe table name."""
+    return re.sub(r"\W+", "_", name.strip()) or "Sheet1"
+
 
 def excel_to_sqlite(xl_bytes: bytes, db_path: Path) -> list[str]:
-    """Load an Excel file (all sheets) into SQLite; return table names."""
-    xls = pd.ExcelFile(xl_bytes)
+    """
+    Load all sheets from an Excel file (bytes) into SQLite.
+    Returns a list of created table names.
+    """
+    xls = pd.ExcelFile(io.BytesIO(xl_bytes))
     engine = create_engine(f"sqlite:///{db_path}")
-    tables = []
+    tables: list[str] = []
+
     with engine.begin() as conn:
         for sheet in xls.sheet_names:
             df = xls.parse(sheet)
-            tbl = sanitize(sheet or "Sheet1")
-            df.to_sql(tbl, conn, if_exists="replace", index=False)
-            tables.append(tbl)
+            tbl_name = sanitize(sheet)
+            df.to_sql(tbl_name, conn, if_exists="replace", index=False)
+            tables.append(tbl_name)
     return tables
 
+
 @st.cache_data(show_spinner=False)
-def get_chain(db_path: Path, tables: list[str]):
-    """Create LangChain SQL agent for the given DB."""
-    llm = OpenAI(temperature=0, api_key=openai_key)
+def get_chain(db_path: Path, tables: list[str]) -> SQLDatabaseChain:
+    """Instantiate a LangChain SQL agent for the given SQLite DB."""
+    llm = OpenAI(temperature=0, api_key=OPENAI_API_KEY)
     db = SQLDatabase.from_uri(f"sqlite:///{db_path}", include_tables=tables)
     return SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True)
 
+
 # ---------- UI ----------
-uploaded = st.file_uploader(
-    "Upload an Excel workbook (.xls, .xlsx)", type=["xls", "xlsx"]
+uploaded_file = st.file_uploader(
+    "Upload an Excel workbook (.xls or .xlsx)",
+    type=["xls", "xlsx"],
+    help="Each sheet becomes a table in a temporary SQLite database."
 )
 
-if uploaded:
-    tmp_db = Path("uploaded.db")
-    tbls = excel_to_sqlite(uploaded.getvalue(), tmp_db)
+if uploaded_file:
+    db_path = Path("uploaded.db")
 
-    st.success(f"Loaded {len(tbls)} sheet(s) ➜ tables: {', '.join(tbls)}")
+    try:
+        table_names = excel_to_sqlite(uploaded_file.getvalue(), db_path)
+    except Exception as err:
+        st.error(f"Failed to read Excel file: {err}")
+        st.stop()
 
-    chain = get_chain(tmp_db, tbls)
+    st.success(
+        f"Loaded {len(table_names)} sheet(s) as table(s): "
+        f"{', '.join(table_names)}"
+    )
 
-    st.markdown("#### Ask a question about your data")
-    user_q = st.text_input("For example: *Total sales this month?*")
+    chain = get_chain(db_path, table_names)
 
-    if st.button("Ask") and user_q:
-        with st.spinner("Thinking..."):
+    st.markdown("#### Ask questions about the data")
+    question = st.text_input("For example: *Total sales by month for 2025-05?*")
+
+    if st.button("Ask") and question:
+        with st.spinner("Thinking…"):
             try:
-                answer = chain.run(user_q)
+                answer = chain.run(question)
                 st.markdown("##### Answer")
                 st.write(answer)
-            except Exception as e:
-                st.error(f"😕 Sorry, I could not answer that.\n\n*{e}*")
+            except Exception as err:
+                st.error(f"Sorry, could not answer that: {err}")
 
     st.caption(
-        "Tip: The agent auto-generates SQL using your question, runs it on the "
-        "tables above, then turns the result into plain-language answers. "
-        "Accuracy improves when questions are unambiguous."
+        "The agent translates your question to SQL, executes it on the tables "
+        "above, then converts the result to natural language. For best accuracy, "
+        "use clear column names and ask specific questions."
     )
 else:
-    st.info("Upload an Excel file to begin.")
+    st.info("👆 Upload an Excel file to start chatting with your data.")
