@@ -1,161 +1,86 @@
-import os, uuid, hashlib, base64, shutil
-from io import BytesIO
+# Streamlit Excel-to-Chat Demo
+import os
+import re
+import sqlite3
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
-from pdf2image import convert_from_path
-from pdf2image.exceptions import PDFInfoNotInstalledError
-from PIL import Image
-from byaldi import RAGMultiModalModel
-from openai import OpenAI
+from dotenv import load_dotenv
+from langchain_community.llms import OpenAI
+from langchain_community.utilities import SQLDatabase
+from langchain_experimental.sql import SQLDatabaseChain
+from sqlalchemy import create_engine
 
-# --------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------
-CACHE_DIR = Path("data/cache")           # persisted between restarts
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# ---------- Setup ----------
+st.set_page_config(page_title="Excel Q&A", layout="wide")
+st.title("📊 Chat with your Excel Data")
 
-UPLOAD_ROOT = Path("uploads")
-UPLOAD_ROOT.mkdir(exist_ok=True)
+# Load environment variables
+load_dotenv()
+openai_key = os.getenv("OPENAI_API_KEY")
 
-GLOBAL_INDEX = CACHE_DIR / "image_index"   # .json + .faiss
-
-# --------------------------------------------------------------------
-# UI config
-# --------------------------------------------------------------------
-st.set_page_config(page_title="RAG Agent", layout="wide")
-st.title("🦾 RAG Agent – PDF Q&A")
-
-# --------------------------------------------------------------------
-# Load ColPali once (CPU-only)
-# --------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading ColPali embeddings…")
-def load_retriever():
-    model = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2", device="cpu")
-    # Load existing global index if present
-    if (GLOBAL_INDEX.with_suffix(".json")).exists():
-        try:
-            model.load(str(GLOBAL_INDEX))
-            st.sidebar.info("Global index loaded from cache.")
-        except Exception as e:
-            st.sidebar.warning(f"Could not load cache: {e}")
-    return model
-
-retriever = load_retriever()
-
-# Keep thumbnails in session
-if "images" not in st.session_state:
-    st.session_state["images"] = {}   # sha -> list[PIL]
-if "ready" not in st.session_state:
-    st.session_state["ready"] = False
-
-# --------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------
-def pdf_sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()[:20]
-
-def pil_to_b64(img: Image.Image) -> str:
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=80)
-    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-
-# --------------------------------------------------------------------
-# Sidebar – upload & index
-# --------------------------------------------------------------------
-st.sidebar.header("📄 Documents")
-files = st.sidebar.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
-
-if st.sidebar.button("Build / Load index", disabled=not files):
-    new_folder = UPLOAD_ROOT / uuid.uuid4().hex
-    new_folder.mkdir()
-
-    new_pdfs = []          # [(sha, path)]
-    for f in files:
-        data = f.read()
-        sha = pdf_sha(data)
-        pdf_path = new_folder / f"{sha}.pdf"
-        pdf_path.write_bytes(data)
-
-        # Convert pages for preview (always, so we have images)
-        try:
-            pages = convert_from_path(pdf_path, dpi=150)
-        except PDFInfoNotInstalledError:
-            st.error("Poppler is missing. Make sure packages.txt has `poppler-utils`.")
-            st.stop()
-
-        st.session_state["images"][sha] = pages
-
-        # Only embed if this PDF hasn't been cached yet
-        if not (GLOBAL_INDEX.with_suffix(".json")).exists() or sha not in retriever.model.doc_ids:
-            new_pdfs.append(pdf_path)
-
-    # Embed batch if there are new PDFs
-    if new_pdfs:
-        with st.spinner("Embedding new PDFs…"):
-            retriever.index(
-        input_path=str(embed_dir),
-        index_name=str(GLOBAL_INDEX),
-        store_collection_with_index=True,
-        overwrite=False
+if not openai_key:
+    st.error(
+        "Add your OpenAI key to a .env file as `OPENAI_API_KEY=sk-...` "
+        "and restart the app."
     )
-    st.sidebar.success("New PDFs embedded and cached.")
+    st.stop()
 
-        
+# ---------- Helpers ----------
+def sanitize(name: str) -> str:
+    """SQLite-safe table name."""
+    return re.sub(r"\W+", "_", name)
 
-    st.session_state["ready"] = True
+def excel_to_sqlite(xl_bytes: bytes, db_path: Path) -> list[str]:
+    """Load an Excel file (all sheets) into SQLite; return table names."""
+    xls = pd.ExcelFile(xl_bytes)
+    engine = create_engine(f"sqlite:///{db_path}")
+    tables = []
+    with engine.begin() as conn:
+        for sheet in xls.sheet_names:
+            df = xls.parse(sheet)
+            tbl = sanitize(sheet or "Sheet1")
+            df.to_sql(tbl, conn, if_exists="replace", index=False)
+            tables.append(tbl)
+    return tables
 
-# --------------------------------------------------------------------
-# Main – ask questions
-# --------------------------------------------------------------------
-if st.session_state["ready"]:
-    # Preview thumbnails
-    st.subheader("Preview")
-    for sha, pages in st.session_state["images"].items():
-        with st.expander(f"Document {sha} — {len(pages)} pages"):
-            cols = st.columns(5)
-            for i, img in enumerate(pages[:20]):
-                thumb = img.copy()
-                thumb.thumbnail((300, 300))
-                cols[i % 5].image(thumb, caption=f"Page {i + 1}", use_column_width=True)
+@st.cache_data(show_spinner=False)
+def get_chain(db_path: Path, tables: list[str]):
+    """Create LangChain SQL agent for the given DB."""
+    llm = OpenAI(temperature=0, api_key=openai_key)
+    db = SQLDatabase.from_uri(f"sqlite:///{db_path}", include_tables=tables)
+    return SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True)
 
-    st.divider()
-    st.subheader("Ask a question")
+# ---------- UI ----------
+uploaded = st.file_uploader(
+    "Upload an Excel workbook (.xls, .xlsx)", type=["xls", "xlsx"]
+)
 
-    q = st.text_area("Question", height=100)
-    if st.button("Get answer", disabled=not q.strip()):
-        with st.spinner("Searching & querying Qwen…"):
-            hits = retriever.search(q, k=3)
-            if not hits:
-                st.error("No relevant information found.")
-                st.stop()
+if uploaded:
+    tmp_db = Path("uploaded.db")
+    tbls = excel_to_sqlite(uploaded.getvalue(), tmp_db)
 
-            ctx_imgs = [st.session_state["images"][h['doc_id']][h['page_num'] - 1]
-                        for h in hits]
-            urls = [pil_to_b64(i) for i in ctx_imgs]
+    st.success(f"Loaded {len(tbls)} sheet(s) ➜ tables: {', '.join(tbls)}")
 
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=os.getenv("OPENROUTER_API_KEY"),
-            )
-            msg = [
-                {"role": "system", "content": "You are a helpful assistant for factory professionals."},
-                {"role": "user", "content": [*[
-                    {"type": "image_url", "image_url": {"url": u}} for u in urls
-                ], {"type": "text", "text": q}]}
-            ]
-            resp = client.chat.completions.create(
-                model="qwen/qwen-2.5-vl-7b-instruct:free",
-                messages=msg,
-                temperature=0
-            )
+    chain = get_chain(tmp_db, tbls)
 
-        st.success("Answer")
-        st.write(resp.choices[0].message.content)
+    st.markdown("#### Ask a question about your data")
+    user_q = st.text_input("For example: *Total sales this month?*")
 
-        st.subheader("Context pages")
-        ccols = st.columns(len(ctx_imgs))
-        for i, img in enumerate(ctx_imgs):
-            ccols[i].image(img, use_column_width=True)
+    if st.button("Ask") and user_q:
+        with st.spinner("Thinking..."):
+            try:
+                answer = chain.run(user_q)
+                st.markdown("##### Answer")
+                st.write(answer)
+            except Exception as e:
+                st.error(f"😕 Sorry, I could not answer that.\n\n*{e}*")
+
+    st.caption(
+        "Tip: The agent auto-generates SQL using your question, runs it on the "
+        "tables above, then turns the result into plain-language answers. "
+        "Accuracy improves when questions are unambiguous."
+    )
 else:
-    st.info("Upload PDFs and click **Build / Load index** to begin.")
+    st.info("Upload an Excel file to begin.")
