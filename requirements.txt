@@ -1,8 +1,11 @@
 streamlit
-pdf2image>=1.17.0
-
-pillow
-byaldi
-qwen-vl-utils
+pandas
+sqlalchemy
 openai
-huggingface_hub[hf_transfer]
+langchain
+langchain-community
+langchain-experimental
+python-dotenv
+tqdm
+llama_index           # optional but handy if you extend the app
+typing-extensions>=4.9
