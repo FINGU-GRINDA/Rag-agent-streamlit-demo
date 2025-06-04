@@ -3,6 +3,7 @@ import os
 import re
 import io
 from pathlib import Path
+from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -32,14 +33,14 @@ def sanitize(name: str) -> str:
     return re.sub(r"\W+", "_", name.strip()) or "Sheet1"
 
 
-def excel_to_sqlite(xl_bytes: bytes, db_path: Path) -> list[str]:
+def excel_to_sqlite(xl_bytes: bytes, db_path: Path) -> List[str]:
     """
-    Load all sheets from an Excel file (bytes) into SQLite.
-    Returns a list of created table names.
+    Load every sheet from an Excel file (bytes) into SQLite.
+    Returns a list of table names.
     """
     xls = pd.ExcelFile(io.BytesIO(xl_bytes))
     engine = create_engine(f"sqlite:///{db_path}")
-    tables: list[str] = []
+    tables: List[str] = []
 
     with engine.begin() as conn:
         for sheet in xls.sheet_names:
@@ -50,11 +51,11 @@ def excel_to_sqlite(xl_bytes: bytes, db_path: Path) -> list[str]:
     return tables
 
 
-@st.cache_data(show_spinner=False)
-def get_chain(db_path: Path, tables: list[str]) -> SQLDatabaseChain:
-    """Instantiate a LangChain SQL agent for the given SQLite DB."""
+@st.cache_resource(show_spinner=False)
+def get_chain(db_path: str, tables: Tuple[str, ...]) -> SQLDatabaseChain:
+    """Create a LangChain SQL agent for the given SQLite DB."""
     llm = OpenAI(temperature=0, api_key=OPENAI_API_KEY)
-    db = SQLDatabase.from_uri(f"sqlite:///{db_path}", include_tables=tables)
+    db = SQLDatabase.from_uri(f"sqlite:///{db_path}", include_tables=list(tables))
     return SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True)
 
 
@@ -79,7 +80,7 @@ if uploaded_file:
         f"{', '.join(table_names)}"
     )
 
-    chain = get_chain(db_path, table_names)
+    chain = get_chain(str(db_path), tuple(table_names))
 
     st.markdown("#### Ask questions about the data")
     question = st.text_input("For example: *Total sales by month for 2025-05?*")
@@ -94,7 +95,7 @@ if uploaded_file:
                 st.error(f"Sorry, could not answer that: {err}")
 
     st.caption(
-        "The agent translates your question to SQL, executes it on the tables "
+        "The agent translates your question to SQL, runs it on the tables "
         "above, then converts the result to natural language. For best accuracy, "
         "use clear column names and ask specific questions."
     )
